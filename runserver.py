@@ -94,6 +94,7 @@ def install_thread_excepthook():
             raise
         except Exception:
             exc_type, exc_value, exc_trace = sys.exc_info()
+            print repr(sys.exc_info())
 
             # Handle Flask's broken pipe when a client prematurely ends
             # the connection.
@@ -190,7 +191,9 @@ def can_start_scanning(args):
     # to the correct one.
     api_version_int = int(args.api_version.replace('.', '0'))
     api_version_map = {
-        8302: 8300
+        8302: 8300,
+        8501: 8500,
+        8705: 8700
     }
     mapped_version_int = api_version_map.get(api_version_int, api_version_int)
 
@@ -213,8 +216,6 @@ def main():
     sys.excepthook = handle_exception
 
     args = get_args()
-    args.root_path = os.path.dirname(os.path.abspath(__file__))
-    init_args(args)
 
     # Abort if status name is not valid.
     regexp = re.compile('^([\w\s\-.]+)$')
@@ -224,10 +225,15 @@ def main():
 
     set_log_and_verbosity(log)
 
+    args.root_path = os.path.dirname(os.path.abspath(__file__))
+    init_args(args)
+
     # Initialize Mr. Mime library
     mrmime_cfg = {
         # We don't want exceptions on captchas because we handle them differently.
         'exception_on_captcha': False,
+        # MrMime shouldn't jitter
+        'jitter_gmo': False,
         'pgpool_system_id': args.status_name
     }
     # Don't clear PGPool URL if it's not given in config but set in MrMime config JSON

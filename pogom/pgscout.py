@@ -16,7 +16,7 @@ def scout_error(error_msg):
     }
 
 
-def pgscout_encounter(p):
+def pgscout_encounter(p, forced=False):
     args = get_args()
 
     # Assemble PGScout request
@@ -25,8 +25,11 @@ def pgscout_encounter(p):
         'encounter_id': p.encounter_id,
         'spawn_point_id': p.spawnpoint_id,
         'latitude': p.latitude,
-        'longitude': p.longitude
+        'longitude': p.longitude,
+        'weather': p.weather_boosted_condition
     }
+    if forced:
+        params['forced'] = '1'
     try:
         r = requests.get(args.pgscout_url, params=params)
     except:

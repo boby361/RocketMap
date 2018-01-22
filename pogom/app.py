@@ -10,11 +10,12 @@ from flask.json import JSONEncoder
 from flask_compress import Compress
 from datetime import datetime
 from s2sphere import LatLng
-from pogom.dyn_img import get_gym_icon
+from pogom.dyn_img import get_gym_icon, get_pokemon_map_icon, get_pokemon_raw_icon
 from pogom.pgscout import scout_error, pgscout_encounter
 from pogom.utils import get_args, get_pokemon_name
 from bisect import bisect_left
 
+from pogom.weather import get_weather_cells, get_s2_coverage, get_weather_alerts
 from .models import (Pokemon, Gym, Pokestop, ScannedLocation,
                      MainWorker, WorkerStatus, Token, HashKeys,
                      SpawnPoint)
@@ -69,6 +70,7 @@ class Pogom(Flask):
         self.route("/serviceWorker.min.js", methods=['GET'])(
             self.render_service_worker_js)
         self.route("/gym_img", methods=['GET'])(self.gym_img)
+        self.route("/pkm_img", methods=['GET'])(self.pokemon_img)
         self.route("/scout", methods=['GET'])(self.scout_pokemon)
         self.route("/<statusname>", methods=['GET'])(self.fullmap)
 
@@ -80,6 +82,21 @@ class Pogom(Flask):
         is_in_battle = 'in_battle' in request.args
         return send_file(get_gym_icon(team, level, raidlevel, pkm, is_in_battle), mimetype='image/png')
 
+    def pokemon_img(self):
+        raw = 'raw' in request.args
+        pkm = int(request.args.get('pkm'))
+        weather = int(request.args.get('weather')) if 'weather' in request.args else 0
+        gender = int(request.args.get('gender')) if 'gender' in request.args else None
+        form = int(request.args.get('form')) if 'form' in request.args else None
+        costume = int(request.args.get('costume')) if 'costume' in request.args else None
+        shiny = 'shiny' in request.args
+        if raw:
+            filename = get_pokemon_raw_icon(pkm, gender=gender, form=form, costume=costume, weather=weather,
+                                            shiny=shiny)
+        else:
+            filename = get_pokemon_map_icon(pkm, weather=weather, gender=gender, form=form, costume=costume)
+        return send_file(filename, mimetype='image/png')
+
     def scout_pokemon(self):
         args = get_args()
         if args.pgscout_url:
@@ -90,7 +107,7 @@ class Pogom(Flask):
                 u"On demand PGScouting a {} at {}, {}.".format(pokemon_name,
                                                               p.latitude,
                                                               p.longitude))
-            scout_result = pgscout_encounter(p)
+            scout_result = pgscout_encounter(p, forced=1)
             if scout_result['success']:
                 self.update_scouted_pokemon(p, scout_result)
                 log.info(
@@ -277,6 +294,7 @@ class Pogom(Flask):
                                lat=map_lat,
                                lng=map_lng,
                                showAllZoomLevel=args.show_all_zoom_level,
+                               generateImages=str(args.generate_images).lower(),
                                gmaps_key=args.gmaps_key,
                                lang=args.locale,
                                show=visibility_flags
@@ -478,6 +496,14 @@ class Pogom(Flask):
                   args.status_page_password):
                 d['main_workers'] = MainWorker.get_all()
                 d['workers'] = WorkerStatus.get_all()
+
+        if request.args.get('weather', 'false') == 'true':
+            d['weather'] = get_weather_cells(swLat, swLng, neLat, neLng)
+        if request.args.get('s2cells', 'false') == 'true':
+            d['s2cells'] = get_s2_coverage(swLat, swLng, neLat, neLng)
+        if request.args.get('weatherAlerts', 'false') == 'true':
+            d['weatherAlerts'] = get_weather_alerts(swLat, swLng, neLat, neLng)
+
         return jsonify(d)
 
     def loc(self):
@@ -571,6 +597,7 @@ class Pogom(Flask):
         return render_template('statistics.html',
                                lat=self.current_location[0],
                                lng=self.current_location[1],
+                               generateImages=str(args.generate_images).lower(),
                                gmaps_key=args.gmaps_key,
                                show=visibility_flags
                                )

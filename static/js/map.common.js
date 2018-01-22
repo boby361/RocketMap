@@ -866,6 +866,10 @@ var StoreOptions = {
         default: '',
         type: StoreTypes.Number
     },
+    'remember_text_level_notify': {
+        default: '',
+        type: StoreTypes.Number
+    },
     'showRaids': {
         default: false,
         type: StoreTypes.Boolean
@@ -932,6 +936,26 @@ var StoreOptions = {
     },
     'showRanges': {
         default: false,
+        type: StoreTypes.Boolean
+    },
+    'showWeatherCells': {
+        default: false,
+        type: StoreTypes.Boolean
+    },
+    'showS2Cells': {
+        default: false,
+        type: StoreTypes.Boolean
+    },
+    'showWeatherAlerts': {
+        default: false,
+        type: StoreTypes.Boolean
+    },
+    'hideNotNotified': {
+        default: false,
+        type: StoreTypes.Boolean
+    },
+    'showPopups': {
+        default: true,
         type: StoreTypes.Boolean
     },
     'playSound': {
@@ -1067,7 +1091,32 @@ var mapData = {
     pokestops: {},
     lurePokemons: {},
     scanned: {},
-    spawnpoints: {}
+    spawnpoints: {},
+    weather: {},
+    s2cells: {},
+    weatherAlerts: {}
+}
+
+function getPokemonIcon(item, sprite, displayHeight) {
+    displayHeight = Math.max(displayHeight, 3)
+    var scale = displayHeight / sprite.iconHeight
+    var scaledIconSize = new google.maps.Size(scale * sprite.iconWidth, scale * sprite.iconHeight)
+    var scaledIconOffset = new google.maps.Point(0, 0)
+    var scaledIconCenterOffset = new google.maps.Point(scale * sprite.iconWidth / 2, scale * sprite.iconHeight / 2)
+
+    let gender_param = item['gender'] ? `&gender=${item['gender']}` : ''
+    let form_param = item['form'] ? `&form=${item['form']}` : ''
+    let costume_param = item['costume'] ? `&costume=${item['costume']}` : ''
+    let weather_param = item['weather_boosted_condition'] ? `&weather=${item['weather_boosted_condition']}` : ''
+    let icon_url = `pkm_img?pkm=${item['pokemon_id']}${gender_param}${form_param}${costume_param}${weather_param}`
+
+    return {
+        url: icon_url,
+        size: scaledIconSize,
+        scaledSize: scaledIconSize,
+        origin: scaledIconOffset,
+        anchor: scaledIconCenterOffset
+    }
 }
 
 function getGoogleSprite(index, sprite, displayHeight) {
@@ -1123,7 +1172,9 @@ function setupPokemonMarkerDetails(item, map, scaleByRarity = true, isNotifyPkmn
 
     iconSize += rarityValue
     markerDetails.rarityValue = rarityValue
-    markerDetails.icon = getGoogleSprite(pokemonIndex, sprite, iconSize)
+    markerDetails.icon = generateImages
+        ? getPokemonIcon(item, sprite, iconSize)
+        : getGoogleSprite(pokemonIndex, sprite, iconSize)
     markerDetails.iconSize = iconSize
 
     return markerDetails
@@ -1201,4 +1252,19 @@ function cssPercentageCircle(text, value, perfect_val, good_val, ok_val, meh_val
                     <span class="prec" id="prec">${text}</span>
                 </div>
             </div>`
+}
+
+function get_pokemon_raw_icon_url(p) {
+    if (!generateImages) {
+        return `static/icons/${p.pokemon_id}.png`
+    }
+    var url = 'pkm_img?raw=1&pkm=' + p.pokemon_id
+    var props = ['gender', 'form', 'costume', 'shiny']
+    for (var i = 0; i < props.length; i++) {
+        var prop = props[i]
+        if (prop in p && p[prop] != null && p[prop]) {
+            url += '&' + prop + '=' + p[prop]
+        }
+    }
+    return url
 }

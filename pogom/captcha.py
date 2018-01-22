@@ -86,7 +86,7 @@ def captcha_overseer_thread(args, account_queue, account_captchas,
 
                         t = Thread(target=captcha_solver_thread,
                                    name='captcha-solver-{}'.format(solverId),
-                                   args=(args, account_queue, account_captchas,
+                                   args=(args, account_queue, account_captchas, account,
                                          hash_key, wh_queue))
                         t.daemon = True
                         t.start()
@@ -118,7 +118,7 @@ def captcha_solver_thread(args, account_queue, account_captchas, hash_key,
         pgacc.hash_key = hash_key
 
     if args.proxy:
-        # Try to fetch a new proxy
+        # Try to fetch a new proxy.
         proxy_num, proxy_url = get_new_proxy(args)
 
         if proxy_url:

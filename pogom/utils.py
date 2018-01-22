@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 
 import sys
+import urllib
+import urlparse
+from threading import Thread
+
 import configargparse
 import os
 import json
@@ -23,6 +27,7 @@ from requests.adapters import HTTPAdapter
 from cHaversine import haversine
 from pprint import pformat
 
+from pogom import dyn_img
 from pogom.pgpool import pgpool_request_accounts
 
 log = logging.getLogger(__name__)
@@ -107,11 +112,11 @@ def get_args():
                               'or are switched out.'))
     parser.add_argument('-ac', '--accountcsv',
                         help=('Load accounts from CSV file containing ' +
-                              '"auth_service,username,passwd" lines.'))
+                              '"auth_service,username,password" lines.'))
     parser.add_argument('-hlvl', '--high-lvl-accounts',
                         help=('Load high level accounts from CSV file '
                               + ' containing '
-                              + '"auth_service,username,passwd"'
+                              + '"auth_service,username,password"'
                               + ' lines.'))
     parser.add_argument('-bh', '--beehive',
                         help=('Use beehive configuration for multiple ' +
@@ -139,9 +144,9 @@ def get_args():
                               ' rather than only once, and store results in' +
                               ' the database.'),
                         action='store_true', default=False)
-    parser.add_argument('-nj', '--no-jitter',
-                        help=("Don't apply random -9m to +9m jitter to " +
-                              "location."),
+    parser.add_argument('-j', '--jitter',
+                        help=('Apply random -5m to +5m jitter to ' +
+                              'location.'),
                         action='store_true', default=False)
     parser.add_argument('-al', '--access-logs',
                         help=("Write web logs to access.log."),
@@ -482,7 +487,7 @@ def get_args():
                         help=('Enables the use of X-FORWARDED-FOR headers ' +
                               'to identify the IP of clients connecting ' +
                               'through these trusted proxies.'))
-    parser.add_argument('--api-version', default='0.83.2',
+    parser.add_argument('--api-version', default='0.87.5',
                         help=('API version currently in use.'))
     parser.add_argument('--no-file-logs',
                         help=('Disable logging to files. ' +
@@ -524,10 +529,12 @@ def get_args():
                         help='Do various things to let map accounts gain XP.',
                         action='store_true', default=False)
     parser.add_argument('-gen', '--generate-images',
-                        help='Use ImageMagick to generate gym images on demand.',
+                        help='Use ImageMagick to generate dynamic icons on demand.',
                         action='store_true', default=False)
     parser.add_argument('-pgsu', '--pgscout-url', default=None,
                         help='URL to query PGScout for Pokemon IV/CP.')
+    parser.add_argument('-pa', '--pogo-assets', default=None,
+                        help='Directory pointing to optional PogoAssets root directory.')
     parser.set_defaults(DEBUG=False)
 
     args = parser.parse_args()
@@ -562,7 +569,8 @@ def get_args():
                     csv_input.append('<username>,<password>')
                     csv_input.append('<ptc/google>,<username>,<password>')
 
-                    # If the number of fields is differend this is not a CSV.
+                    # If the number of fields is different,
+                    # then this is not a CSV.
                     if num_fields != line.count(',') + 1:
                         print(sys.argv[0] +
                               ": Error parsing CSV file on line " + str(num) +
@@ -610,7 +618,7 @@ def get_args():
 
                     # If the number of fields is three then assume this is
                     # "ptc,username,password". As requested.
-                    if num_fields == 3:
+                    if num_fields >= 3:
                         # If field 0 is not ptc or google something is wrong!
                         if (fields[0].lower() == 'ptc' or
                                 fields[0].lower() == 'google'):
@@ -631,12 +639,6 @@ def get_args():
                             args.password.append(fields[2])
                         else:
                             field_error = 'password'
-
-                    if num_fields > 3:
-                        print(('Too many fields in accounts file: max ' +
-                               'supported are 3 fields. ' +
-                               'Found {} fields').format(num_fields))
-                        sys.exit(1)
 
                     # If something is wrong display error.
                     if field_error != '':
@@ -742,7 +744,7 @@ def get_args():
 
                         line = line.split(',')
 
-                        # We need "service, user, pass".
+                        # We need "service, username, password".
                         if len(line) < 3:
                             raise Exception('L30 account is missing a'
                                             + ' field. Each line requires: '
@@ -761,15 +763,6 @@ def get_args():
                         }
 
                         args.accounts_L30.append(hlvl_account)
-
-        # Normalize PGScout URL
-        if args.pgscout_url:
-            # Remove trailing slashes
-            if args.pgscout_url.endswith('/'):
-                args.pgscout_url = args.pgscout_url[:len(args.pgscout_url) - 1]
-            # Add /iv if needed
-            if not args.pgscout_url.endswith('/iv'):
-                args.pgscout_url = '{}/iv'.format(args.pgscout_url)
 
         # Prepare the IV/CP scanning filters.
         args.enc_whitelist = []
@@ -817,9 +810,61 @@ def get_args():
         else:
             args.wh_types = frozenset([i for i in args.wh_types])
 
+    # Normalize PGScout URL
+    if args.pgscout_url:
+        # Remove trailing slashes
+        if args.pgscout_url.endswith('/'):
+            args.pgscout_url = args.pgscout_url[:len(args.pgscout_url) - 1]
+        # Add /iv if needed
+        if not args.pgscout_url.endswith('/iv'):
+            args.pgscout_url = '{}/iv'.format(args.pgscout_url)
+
     args.locales_dir = 'static/dist/locales'
     args.data_dir = 'static/dist/data'
+
     return args
+
+
+def init_dynamic_images(args):
+    if args.generate_images:
+        executable = determine_imagemagick_binary()
+        if executable:
+            dyn_img.generate_images = True
+            dyn_img.imagemagick_executable = executable
+            log.info("Generating icons using ImageMagick executable '{}'.".format(executable))
+
+            if args.pogo_assets:
+                decr_assets_dir = os.path.join(args.pogo_assets, 'decrypted_assets')
+                if os.path.isdir(decr_assets_dir):
+                    log.info("Using PogoAssets repository at '{}'".format(args.pogo_assets))
+                    dyn_img.pogo_assets = args.pogo_assets
+                else:
+                    log.error("Could not find PogoAssets repository at '{}'."
+                              " Clone via 'git clone -depth 1 https://github.com/ZeChrales/PogoAssets.git'".format(args.pogo_assets))
+        else:
+            log.error("Could not find ImageMagick executable. Make sure you can execute either 'magick' (ImageMagick 7)"
+                      " or 'convert' (ImageMagick 6) from the commandline. Otherwise you cannot use --generate-images")
+            sys.exit(1)
+
+
+def is_imagemagick_binary(binary):
+    try:
+        process = subprocess.Popen([binary, '-version'], stdout=subprocess.PIPE)
+        out, err = process.communicate()
+        return "ImageMagick" in out
+    except:
+        return False
+
+
+def determine_imagemagick_binary():
+    candidates = {
+        'magick': 'magick convert',
+        'convert': None
+    }
+    for c in candidates:
+        if is_imagemagick_binary(c):
+            return candidates[c] if candidates[c] else c
+    return None
 
 
 def init_args(args):
@@ -829,16 +874,40 @@ def init_args(args):
     :param args: The parsed commandline arguments
     """
 
+    watchercfg = {}
     # IV/CP scanning.
     if args.enc_whitelist_file:
-        with open(args.enc_whitelist_file) as f:
-            args.enc_whitelist = read_pokemon_ids_from_file(f)
+        log.info("Watching encounter whitelist file {} for changes.".format(args.enc_whitelist_file))
+        watchercfg['enc_whitelist'] = (args.enc_whitelist_file, None)
 
     # Prepare webhook whitelist - empty list means no restrictions
     args.webhook_whitelist = []
     if args.webhook_whitelist_file:
-        with open(args.webhook_whitelist_file) as f:
-            args.webhook_whitelist = read_pokemon_ids_from_file(f)
+        log.info("Watching webhook whitelist file {} for changes.".format(args.webhook_whitelist_file))
+        watchercfg['webhook_whitelist'] = (args.webhook_whitelist_file, None)
+
+    t = Thread(target=watch_pokemon_lists, args=(args, watchercfg))
+    t.daemon = True
+    t.start()
+
+    init_dynamic_images(args)
+
+
+def watch_pokemon_lists(args, cfg):
+    while True:
+        for args_key in cfg:
+            filename, tstamp = cfg[args_key]
+
+            statbuf = os.stat(filename)
+            current_mtime = statbuf.st_mtime
+
+            if current_mtime != tstamp:
+                with open(filename) as f:
+                    setattr(args, args_key, read_pokemon_ids_from_file(f))
+                    log.info("File {} changed on disk. Re-read as {}.".format(filename, args_key))
+                cfg[args_key] = (filename, current_mtime)
+
+        time.sleep(5)
 
 
 def now():

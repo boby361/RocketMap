@@ -10,6 +10,7 @@ import time
 import geopy
 import math
 
+import s2sphere
 from peewee import (InsertQuery, Check, CompositeKey, ForeignKeyField,
                     SmallIntegerField, IntegerField, CharField, DoubleField,
                     BooleanField, DateTimeField, fn, DeleteQuery, FloatField,
@@ -37,6 +38,9 @@ from .customLog import printPokemon
 from .account import pokestop_spinnable, spin_pokestop, incubate_eggs, setup_mrmime_account, \
     encounter_pokemon_request, clear_pokemon
 from .proxy import get_new_proxy
+from pgoapi.protos.pogoprotos.map.weather.gameplay_weather_pb2 import *
+from pgoapi.protos.pogoprotos.map.weather.weather_alert_pb2 import *
+from pgoapi.protos.pogoprotos.networking.responses.get_map_objects_response_pb2 import *
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +48,7 @@ args = get_args()
 flaskDb = FlaskDB()
 cache = TTLCache(maxsize=100, ttl=60 * 5)
 
-db_schema_version = 22
+db_schema_version = 25
 
 
 class MyRetryDB(RetryOperationalError, PooledMySQLDatabase):
@@ -132,11 +136,13 @@ class Pokemon(LatLongModel):
     height = FloatField(null=True)
     gender = SmallIntegerField(null=True)
     form = SmallIntegerField(null=True)
+    costume = SmallIntegerField(null=True)
     catch_prob_1 = DoubleField(null=True)
     catch_prob_2 = DoubleField(null=True)
     catch_prob_3 = DoubleField(null=True)
     rating_attack = CharField(null=True, max_length=2)
     rating_defense = CharField(null=True, max_length=2)
+    weather_boosted_condition = SmallIntegerField(null=True)
     last_modified = DateTimeField(
         null=True, index=True, default=datetime.utcnow)
 
@@ -457,6 +463,11 @@ class Gym(LatLongModel):
     longitude = DoubleField()
     total_cp = SmallIntegerField()
     is_in_battle = BooleanField()
+    gender = SmallIntegerField(null=True)
+    form = SmallIntegerField(null=True)
+    costume = SmallIntegerField(null=True)
+    weather_boosted_condition = SmallIntegerField(null=True)
+    shiny = BooleanField(null=True)
     last_modified = DateTimeField(index=True)
     last_scanned = DateTimeField(default=datetime.utcnow, index=True)
 
@@ -527,6 +538,11 @@ class Gym(LatLongModel):
                            GymMember.deployment_time,
                            GymMember.last_scanned,
                            GymPokemon.pokemon_id,
+                           GymPokemon.gender,
+                           GymPokemon.form,
+                           GymPokemon.costume,
+                           GymPokemon.weather_boosted_condition,
+                           GymPokemon.shiny,
                            Trainer.name.alias('trainer_name'),
                            Trainer.level.alias('trainer_level'))
                        .join(Gym, on=(GymMember.gym_id == Gym.gym_id))
@@ -579,6 +595,11 @@ class Gym(LatLongModel):
                               GymDetails.name,
                               GymDetails.description,
                               Gym.guard_pokemon_id,
+                              Gym.gender,
+                              Gym.form,
+                              Gym.costume,
+                              Gym.weather_boosted_condition,
+                              Gym.shiny,
                               Gym.slots_available,
                               Gym.latitude,
                               Gym.longitude,
@@ -610,6 +631,11 @@ class Gym(LatLongModel):
                            GymPokemon.iv_attack,
                            GymPokemon.iv_defense,
                            GymPokemon.iv_stamina,
+                           GymPokemon.gender,
+                           GymPokemon.form,
+                           GymPokemon.costume,
+                           GymPokemon.weather_boosted_condition,
+                           GymPokemon.shiny,
                            Trainer.name.alias('trainer_name'),
                            Trainer.level.alias('trainer_level'))
                    .join(Gym, on=(GymMember.gym_id == Gym.gym_id))
@@ -1769,6 +1795,11 @@ class GymPokemon(BaseModel):
     iv_defense = SmallIntegerField(null=True)
     iv_stamina = SmallIntegerField(null=True)
     iv_attack = SmallIntegerField(null=True)
+    gender = SmallIntegerField(null=True)
+    form = SmallIntegerField(null=True)
+    costume = SmallIntegerField(null=True)
+    weather_boosted_condition = SmallIntegerField(null=True)
+    shiny = BooleanField(null=True)
     last_seen = DateTimeField(default=datetime.utcnow)
 
 
@@ -1818,6 +1849,58 @@ class Token(BaseModel):
             log.error('Failed captcha token transactional query: {}'.format(e))
 
         return tokens
+
+
+class Weather(BaseModel):
+    s2_cell_id = Utf8mb4CharField(primary_key=True, max_length=50)
+    latitude = DoubleField()
+    longitude = DoubleField()
+    cloud_level = SmallIntegerField(null=True, index=True)
+    rain_level = SmallIntegerField(null=True, index=True)
+    wind_level = SmallIntegerField(null=True, index=True)
+    snow_level = SmallIntegerField(null=True, index=True)
+    fog_level = SmallIntegerField(null=True, index=True)
+    wind_direction = SmallIntegerField(null=True, index=True)
+    gameplay_weather = SmallIntegerField(null=True, index=True)
+    severity = SmallIntegerField(null=True, index=True)
+    warn_weather = SmallIntegerField(null=True, index=True)
+    world_time = SmallIntegerField(null=True, index=True)
+    last_updated = DateTimeField(default=datetime.utcnow, null=True, index=True)
+
+
+    @staticmethod
+    def get_weathers():
+        query = Weather.select().dicts()
+
+        weathers = []
+        for w in query:
+            weathers.append(w)
+
+        return weathers
+
+    @staticmethod
+    def get_weather_by_location(swLat, swLng, neLat, neLng, alert):
+        # We can filter by the center of a cell, this deltas can expand the viewport bounds
+        # So cells with center outside the viewport, but close to it can be rendered
+        # otherwise edges of cells that intersects with viewport won't be rendered
+        lat_delta = 0.15
+        lng_delta = 0.4
+        if not alert:
+            query = Weather.select().where((Weather.latitude >= float(swLat) - lat_delta) &
+                                           (Weather.longitude >= float(swLng) - lng_delta) &
+                                           (Weather.latitude <= float(neLat) + lat_delta) &
+                                           (Weather.longitude <= float(neLng) + lng_delta)).dicts()
+        else:
+            query = Weather.select().where((Weather.latitude >= float(swLat) - lat_delta) &
+                                           (Weather.longitude >= float(swLng) - lng_delta) &
+                                           (Weather.latitude <= float(neLat) + lat_delta) &
+                                           (Weather.longitude <= float(neLng) + lng_delta) &
+                                           (Weather.severity.is_null(False))).dicts()
+        weathers = []
+        for w in query:
+            weathers.append(w)
+
+        return weathers
 
 
 class HashKeys(BaseModel):
@@ -1884,6 +1967,7 @@ def perform_pgscout(p):
     pkm.spawnpoint_id = p.spawn_point_id
     pkm.latitude = p.latitude
     pkm.longitude = p.longitude
+    pkm.weather_boosted_condition = p.pokemon_data.pokemon_display.weather_boosted_condition
     scout_result = pgscout_encounter(pkm)
     if scout_result['success']:
         log.info(
@@ -1898,8 +1982,9 @@ def perform_pgscout(p):
 
 
 # todo: this probably shouldn't _really_ be in "models" anymore, but w/e.
-def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
-              key_scheduler, pgacc, status, now_date, account, account_sets):
+def parse_map(args, map_dict, scan_coords, scan_location, db_update_queue,
+              wh_update_queue, key_scheduler, pgacc, status, now_date, account,
+              account_sets):
     pokemon = {}
     pokestops = {}
     gyms = {}
@@ -1917,14 +2002,24 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
     sightings = {}
     new_spawn_points = []
     sp_id_list = []
+    s2_cell_id = {}
+    weather_alert = []
+    display_weather = {}
+    gameplay_weather = {}
+    weather = {}
 
     # Consolidate the individual lists in each cell into two lists of Pokemon
     # and a list of forts.
     cells = map_dict['GET_MAP_OBJECTS'].map_cells
+    cellweathers = map_dict['GET_MAP_OBJECTS'].client_weather
+    worldtime = map_dict['GET_MAP_OBJECTS'].time_of_day
     # Get the level for the pokestop spin, and to send to webhook.
     level = pgacc.get_stats('level')
     # Use separate level indicator for our L30 encounters.
     encounter_level = level
+
+    log.debug(cellweathers)
+    log.debug(worldtime)
 
     for i, cell in enumerate(cells):
         # If we have map responses then use the time from the request
@@ -1946,9 +2041,71 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
         wild_pokemon_count += len(cell.wild_pokemons)
         forts_count += len(cell.forts)
 
+    # 0.85.1 Map Weather
+    for i, cell in enumerate(cellweathers):
+        # Parse Map Weather Information
+        s2_cell_id = cell.s2_cell_id
+        display_weather = cell.display_weather
+        gameplay_weather = cell.gameplay_weather
+        weather_alert = cell.alerts
+
+        # Convert Cell To Lat, Long
+        cell_id = s2sphere.CellId(long(s2_cell_id))
+        cell = s2sphere.Cell(cell_id)
+        center = s2sphere.LatLng.from_point(cell.get_center())
+        lat = center.lat().degrees
+        lng = center.lng().degrees
+
     now_secs = date_secs(now_date)
 
     del map_dict['GET_MAP_OBJECTS']
+
+    # Severe Weather Alerts
+    severity = None
+    warn = None
+    if weather_alert:
+        for w in weather_alert:
+            log.info('Weather Alerts Active: %s, Severity Level: %s',
+                            w.warn_weather,
+                            WeatherAlert.Severity.Name(w.severity))
+            severity = w.severity
+            warn = w.warn_weather
+
+    # Hourly Weather Update (On The Hour)
+    if display_weather:
+        gameplayweather = gameplay_weather.gameplay_condition
+        # Weather Table Database Update
+        weather[s2_cell_id] = {
+            's2_cell_id': s2_cell_id,
+            'latitude': lat,
+            'longitude': lng,
+            'cloud_level': display_weather.cloud_level,
+            'rain_level': display_weather.rain_level,
+            'wind_level': display_weather.wind_level,
+            'snow_level': display_weather.snow_level,
+            'fog_level': display_weather.fog_level,
+            'wind_direction': display_weather.wind_direction,
+            'gameplay_weather': gameplayweather,
+            'severity': severity,
+            'warn_weather': warn,
+            'world_time': worldtime,
+        }
+        # Weather Information Log
+        log.info('Weather Info: Cloud Level: %s, Rain Level: %s, ' +
+            'Wind Level: %s, Snow Level: %s, Fog Level: %s, ' +
+            'Wind Direction: %s Degreese.', display_weather.cloud_level,
+            display_weather.rain_level, display_weather.wind_level,
+            display_weather.snow_level, display_weather.fog_level,
+            display_weather.wind_direction)
+
+        log.info('GamePlay Conditions: %s - %s Bonus.',
+                    GetMapObjectsResponse.TimeOfDay.Name(worldtime),
+                    GameplayWeather.WeatherCondition.Name(gameplayweather))
+
+    log.debug(weather)
+    log.info('Upserted %d weather details.',
+             len(weather))
+
 
     # If there are no wild or nearby Pokemon...
     if not wild_pokemon and not nearby_pokemon:
@@ -1965,10 +2122,9 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
             log.warning('No nearby or wild Pokemon but there are visible '
                         'gyms or pokestops. Possible speed violation.')
 
-    scan_loc = ScannedLocation.get_by_loc(step_location)
-    done_already = scan_loc['done']
-    ScannedLocation.update_band(scan_loc, now_date)
-    just_completed = not done_already and scan_loc['done']
+    done_already = scan_location['done']
+    ScannedLocation.update_band(scan_location, now_date)
+    just_completed = not done_already and scan_location['done']
 
     if wild_pokemon and not args.no_pokemon:
         encounter_ids = [b64encode(str(p.encounter_id))
@@ -2027,9 +2183,9 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
                     sp['latest_seen'] = d_t_secs
                     sp['earliest_unseen'] = d_t_secs
 
-            scan_spawn_points[scan_loc['cellid'] + sp['id']] = {
+            scan_spawn_points[scan_location['cellid'] + sp['id']] = {
                 'spawnpoint': sp['id'],
-                'scannedlocation': scan_loc['cellid']}
+                'scannedlocation': scan_location['cellid']}
             if not sp['last_scanned']:
                 log.info('New Spawn Point found.')
                 new_spawn_points.append(sp)
@@ -2037,16 +2193,16 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
                 # If we found a new spawnpoint after the location was already
                 # fully scanned then either it's new, or we had a bad scan.
                 # Either way, rescan the location.
-                if scan_loc['done'] and not just_completed:
+                if scan_location['done'] and not just_completed:
                     log.warning('Location was fully scanned, and yet a brand '
                                 'new spawnpoint found.')
                     log.warning('Redoing scan of this location to identify '
                                 'new spawnpoint.')
-                    ScannedLocation.reset_bands(scan_loc)
+                    ScannedLocation.reset_bands(scan_location)
 
             if (not SpawnPoint.tth_found(sp) or sighting['tth_secs'] or
-                    not scan_loc['done'] or just_completed):
-                SpawnpointDetectionData.classify(sp, scan_loc, now_secs,
+                    not scan_location['done'] or just_completed):
+                SpawnpointDetectionData.classify(sp, scan_location, now_secs,
                                                  sighting)
                 sightings[p.encounter_id] = sighting
 
@@ -2073,6 +2229,14 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
                 log.debug('Ignoring Pokemon id: %i.', pokemon_id)
                 filtered += 1
                 continue
+
+            # Catch pokemon to check for Ditto if --gain-xp enabled
+            # Original code by voxx!
+            have_balls = pgacc.inventory_balls > 0
+            if args.gain_xp and not pgacc.get_stats(
+                'level') >= 30 and pokemon_id in DITTO_CANDIDATES_IDS and have_balls:
+                if is_ditto(args, pgacc, p):
+                    pokemon_id = 132
 
             printPokemon(pokemon_id, p.latitude, p.longitude,
                          disappear_time)
@@ -2106,24 +2270,22 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
                 'weight': None,
                 'gender': p.pokemon_data.pokemon_display.gender,
                 'form': None,
+                'costume': p.pokemon_data.pokemon_display.costume,
                 'catch_prob_1': None,
                 'catch_prob_2': None,
                 'catch_prob_3': None,
                 'rating_attack': None,
-                'rating_defense': None
+                'rating_defense': None,
+                'weather_boosted_condition' : None
             }
 
-            # Catch pokemon to check for Ditto if --gain-xp enabled
-            # Original code by voxx!
-            have_balls = pgacc.inventory_balls > 0
-            if args.gain_xp and not pgacc.get_stats(
-                'level') >= 30 and pokemon_id in DITTO_CANDIDATES_IDS and have_balls:
-                if is_ditto(args, pgacc, p):
-                    pokemon[p.encounter_id]['pokemon_id'] = 132
-                    pokemon_id = 132
-                    pokemon_info = None
+            # Weather Pokemon Bonus
+            weather_boosted_condition = p.pokemon_data.pokemon_display.weather_boosted_condition
+            if weather_boosted_condition:
+                pokemon[p.encounter_id]['weather_boosted_condition'] = weather_boosted_condition
+
             # Check for Unown's alphabetic character.
-            elif pokemon_id == 201:
+            if pokemon_id == 201:
                 pokemon[p.encounter_id]['form'] = (p.pokemon_data
                                                     .pokemon_display.form)
 
@@ -2174,7 +2336,8 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
                         'seconds_until_despawn': seconds_until_despawn,
                         'spawn_start': start_end[0],
                         'spawn_end': start_end[1],
-                        'player_level': encounter_level
+                        'player_level': encounter_level,
+                        'weather': weather_boosted_condition
                     })
                     if wh_poke['cp_multiplier'] is not None:
                         wh_poke.update({
@@ -2292,6 +2455,16 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
                         f.owned_by_team,
                     'guard_pokemon_id':
                         f.guard_pokemon_id,
+                    'gender':
+                        f.guard_pokemon_display.gender,
+                    'form':
+                        f.guard_pokemon_display.form,
+                    'costume':
+                        f.guard_pokemon_display.costume,
+                    'weather_boosted_condition':
+                        f.guard_pokemon_display.weather_boosted_condition,
+                    'shiny':
+                        f.guard_pokemon_display.shiny,
                     'slots_available':
                         gym_display.slots_available,
                     'total_cp':
@@ -2353,13 +2526,13 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
 
         # Let db do it's things while we try to spin.
         if args.gain_xp:
-            gxp_spin_stops(forts, pgacc, step_location)
+            gxp_spin_stops(forts, pgacc, scan_coords)
             incubate_eggs(pgacc)
         elif args.pokestop_spinning or pgacc.get_stats('level', 1) == 1:
             for f in forts:
                 # Spin Pokestop with 50% chance.
-                if f.type == 1 and pokestop_spinnable(f, step_location):
-                    if spin_pokestop(pgacc, account, args, f, step_location):
+                if f.type == 1 and pokestop_spinnable(f, scan_coords):
+                    if spin_pokestop(pgacc, account, args, f, scan_coords):
                         incubate_eggs(pgacc)
 
         # Helping out the GC.
@@ -2378,7 +2551,10 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
 
     # Look for spawnpoints within scan_loc that are not here to see if we
     # can narrow down tth window.
-    for sp in ScannedLocation.linked_spawn_points(scan_loc['cellid']):
+    for sp in ScannedLocation.linked_spawn_points(scan_location['cellid']):
+        if sp['missed_count'] > 5:
+                continue
+
         if sp['id'] in sp_id_list:
             # Don't overwrite changes from this parse with DB version.
             sp = spawn_points[sp['id']]
@@ -2386,7 +2562,7 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
             # If the cell has completed, we need to classify all
             # the SPs that were not picked up in the scan
             if just_completed:
-                SpawnpointDetectionData.classify(sp, scan_loc, now_secs)
+                SpawnpointDetectionData.classify(sp, scan_location, now_secs)
                 spawn_points[sp['id']] = sp
             if SpawnpointDetectionData.unseen(sp, now_secs):
                 spawn_points[sp['id']] = sp
@@ -2402,7 +2578,7 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
                 log.info('hidden period, or Niantic has removed '
                          'spawnpoint.')
 
-        if (not SpawnPoint.tth_found(sp) and scan_loc['done'] and
+        if (not SpawnPoint.tth_found(sp) and scan_location['done'] and
                 (now_secs - sp['latest_seen'] -
                  args.spawn_delay) % 3600 < 60):
             log.warning('Spawnpoint %s was unable to locate a TTH, with '
@@ -2410,13 +2586,13 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
                         (now_secs - sp['latest_seen']) % 3600)
             log.info('Restarting current 15 minute search for TTH.')
             if sp['id'] not in sp_id_list:
-                SpawnpointDetectionData.classify(sp, scan_loc, now_secs)
+                SpawnpointDetectionData.classify(sp, scan_location, now_secs)
             sp['latest_seen'] = (sp['latest_seen'] - 60) % 3600
             sp['earliest_unseen'] = (
                 sp['earliest_unseen'] + 14 * 60) % 3600
             spawn_points[sp['id']] = sp
 
-    db_update_queue.put((ScannedLocation, {0: scan_loc}))
+    db_update_queue.put((ScannedLocation, {0: scan_location}))
 
     if pokemon:
         db_update_queue.put((Pokemon, pokemon))
@@ -2431,6 +2607,8 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue,
         db_update_queue.put((ScanSpawnPoint, scan_spawn_points))
         if sightings:
             db_update_queue.put((SpawnpointDetectionData, sightings))
+    if weather:
+        db_update_queue.put((Weather, weather))
 
     if not nearby_pokemon and not wild_pokemon:
         # After parsing the forts, we'll mark this scan as bad due to
@@ -2642,6 +2820,11 @@ def parse_gyms(args, gym_responses, wh_update_queue, db_update_queue):
                 'iv_defense': pokemon.individual_defense,
                 'iv_stamina': pokemon.individual_stamina,
                 'iv_attack': pokemon.individual_attack,
+                'gender': pokemon.pokemon_display.gender,
+                'form': pokemon.pokemon_display.form,
+                'costume': pokemon.pokemon_display.costume,
+                'weather_boosted_condition': pokemon.pokemon_display.weather_boosted_condition,
+                'shiny': pokemon.pokemon_display.shiny,
                 'last_seen': datetime.utcnow(),
             }
 
@@ -2763,6 +2946,13 @@ def clean_db_loop(args):
                                  (datetime.utcnow() - timedelta(minutes=2)))))
                 query.execute()
 
+                # Remove old weather
+                query = (Weather
+                         .delete()
+                         .where((Weather.last_updated <
+                                 (datetime.utcnow() - timedelta(minutes=15)))))
+                query.execute()
+
                 # Remove expired HashKeys
                 query = (HashKeys
                          .delete()
@@ -2845,7 +3035,7 @@ def create_tables(db):
     tables = [Pokemon, Pokestop, Gym, Raid, ScannedLocation, GymDetails,
               GymMember, GymPokemon, Trainer, MainWorker, WorkerStatus,
               SpawnPoint, ScanSpawnPoint, SpawnpointDetectionData,
-              Token, LocationAltitude, PlayerLocale, HashKeys]
+              Token, LocationAltitude, PlayerLocale, HashKeys, Weather]
     with db.execution_context():
         for table in tables:
             if not table.table_exists():
@@ -2861,7 +3051,7 @@ def drop_tables(db):
               GymDetails, GymMember, GymPokemon, Trainer, MainWorker,
               WorkerStatus, SpawnPoint, ScanSpawnPoint,
               SpawnpointDetectionData, LocationAltitude, PlayerLocale,
-              Token, HashKeys]
+              Token, HashKeys, Weather]
     with db.execution_context():
         db.execute_sql('SET FOREIGN_KEY_CHECKS=0;')
         for table in tables:
@@ -3183,6 +3373,42 @@ def database_migrate(db, old_ver):
         migrate(
             migrator.add_column('gym', 'is_in_battle',
                                 BooleanField(null=False, default=False)))
+
+    if old_ver < 23:
+        migrate(
+            migrator.add_column('pokemon', 'weather_boosted_condition',
+                                SmallIntegerField(null=True))
+        )
+
+    if old_ver < 24:
+        migrate(
+            migrator.add_column('pokemon', 'costume',
+                                SmallIntegerField(null=True))
+        )
+
+    if old_ver < 25:
+        migrate(
+            migrator.add_column('gympokemon', 'gender',
+                                SmallIntegerField(null=True)),
+            migrator.add_column('gympokemon', 'form',
+                                SmallIntegerField(null=True)),
+            migrator.add_column('gympokemon', 'costume',
+                                SmallIntegerField(null=True)),
+            migrator.add_column('gympokemon', 'weather_boosted_condition',
+                                SmallIntegerField(null=True)),
+            migrator.add_column('gympokemon', 'shiny',
+                                BooleanField(null=True)),
+            migrator.add_column('gym', 'gender',
+                                SmallIntegerField(null=True)),
+            migrator.add_column('gym', 'form',
+                                SmallIntegerField(null=True)),
+            migrator.add_column('gym', 'costume',
+                                SmallIntegerField(null=True)),
+            migrator.add_column('gym', 'weather_boosted_condition',
+                                SmallIntegerField(null=True)),
+            migrator.add_column('gym', 'shiny',
+                                BooleanField(null=True))
+        )
 
     # Always log that we're done.
     log.info('Schema upgrade complete.')
